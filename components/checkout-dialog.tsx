@@ -1,22 +1,21 @@
 "use client"
 
 import type React from "react"
-
-import { useState } from "react"
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { useEffect, useRef, useState } from "react"
+import { CreditCard, Loader2, MapPin, Truck } from "lucide-react"
+import { z } from "zod"
 import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
-import { MapPin, Truck, CreditCard, Loader2 } from "lucide-react"
 import { useToast } from "@/hooks/use-toast"
 
 interface CartItem {
   id: number
   name: string
-  price: number
-  image: string
+  priceCents: number
   quantity: number
   selectedSize: string
 }
@@ -25,49 +24,82 @@ interface CheckoutDialogProps {
   isOpen: boolean
   onClose: () => void
   cart: CartItem[]
-  totalPrice: number
+}
+
+interface ShippingOption {
+  id: "economic" | "standard" | "express"
+  name: string
+  days: string
+  priceCents: number
 }
 
 interface Address {
   cep: string
-  logradouro: string
-  complemento: string
-  bairro: string
-  localidade: string
-  uf: string
-  erro?: boolean
+  street: string
+  complement: string
+  district: string
+  city: string
+  state: string
 }
 
-interface FakeStoreUser {
-  id: number
-  email: string
-  username: string
-  password: string
-  name: {
-    firstname: string
-    lastname: string
-  }
-  address: {
-    city: string
-    street: string
-    number: number
-    zipcode: string
-    geolocation: {
-      lat: string
-      long: string
-    }
-  }
-  phone: string
+const addressResponseSchema = z.object({
+  cep: z.string(),
+  logradouro: z.string(),
+  complemento: z.string(),
+  bairro: z.string(),
+  localidade: z.string(),
+  uf: z.string(),
+  erro: z.boolean().optional(),
+})
+
+const shippingOptionsSchema = z.array(
+  z.object({
+    id: z.enum(["economic", "standard", "express"]),
+    name: z.string(),
+    days: z.string(),
+    priceCents: z.number().int().nonnegative(),
+  }),
+)
+
+const customerSchema = z.object({
+  name: z.string().trim().min(2).max(120),
+  email: z.string().trim().email().max(254),
+  phone: z.string().trim().min(8).max(30),
+  number: z.string().trim().min(1).max(20),
+  complement: z.string().trim().max(120),
+})
+
+function formatPrice(cents: number): string {
+  return new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(cents / 100)
 }
 
-export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: CheckoutDialogProps) {
+function isMercadoPagoUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
+    return (
+      url.protocol === "https:" &&
+      (url.hostname === "mercadopago.com.br" ||
+        url.hostname.endsWith(".mercadopago.com.br") ||
+        url.hostname === "mercadopago.com" ||
+        url.hostname.endsWith(".mercadopago.com"))
+    )
+  } catch {
+    return false
+  }
+}
+
+export default function CheckoutDialog({ isOpen, onClose, cart }: CheckoutDialogProps) {
   const [step, setStep] = useState(1)
   const [cep, setCep] = useState("")
   const [address, setAddress] = useState<Address | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [fakeStoreData, setFakeStoreData] = useState<FakeStoreUser | null>(null)
-  const [deliveryOption, setDeliveryOption] = useState("standard")
-  const [paymentMethod, setPaymentMethod] = useState("credit")
+  const [loadingAddress, setLoadingAddress] = useState(false)
+  const [savingOrder, setSavingOrder] = useState(false)
+  const [loadingShipping, setLoadingShipping] = useState(false)
+  const [shippingOptions, setShippingOptions] = useState<ShippingOption[]>([])
+  const [shippingError, setShippingError] = useState("")
+  const [deliveryOption, setDeliveryOption] = useState<ShippingOption["id"]>("standard")
+  const [paymentMethod, setPaymentMethod] = useState<"pix" | "card">("pix")
+  const attempt = useRef<{ payload: string; key: string } | null>(null)
   const { toast } = useToast()
 
   const [customerData, setCustomerData] = useState({
@@ -78,108 +110,162 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
     complement: "",
   })
 
-  const fetchAddressByCep = async (cepValue: string) => {
-    setLoading(true)
-    try {
-      const cleanCep = cepValue.replace(/\D/g, "")
+  useEffect(() => {
+    if (!isOpen) return
+    const controller = new AbortController()
+    setShippingError("")
+    setShippingOptions([])
+    setLoadingShipping(true)
 
-      if (cleanCep.length !== 8) {
-        throw new Error("CEP deve ter 8 dígitos")
-      }
-
-      // Consulta ViaCEP para endereço brasileiro
-      const response = await fetch(`https://viacep.com.br/ws/${cleanCep}/json/`)
-      const data = await response.json()
-
-      if (data.erro) {
-        throw new Error("CEP não encontrado")
-      }
-
-      setAddress(data)
-
-      // Simular busca de dados do usuário na Fake Store API
-      const fakeStoreResponse = await fetch("https://fakestoreapi.com/users/1")
-      const userData = await fakeStoreResponse.json()
-      setFakeStoreData(userData)
-
-      toast({
-        title: "Endereço encontrado!",
-        description: `${data.logradouro}, ${data.bairro} - ${data.localidade}/${data.uf}`,
+    fetch("/api/shipping", { signal: controller.signal, cache: "no-store" })
+      .then(async (response) => {
+        const body: unknown = await response.json()
+        if (!response.ok) {
+          const message = (body as { error?: string }).error
+          throw new Error(message ?? "Frete indisponível.")
+        }
+        const parsed = shippingOptionsSchema.safeParse(body)
+        if (!parsed.success) throw new Error("O servidor retornou opções de frete inválidas.")
+        setShippingOptions(parsed.data)
+        if (parsed.data.length > 0) setDeliveryOption(parsed.data[0].id)
+      })
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") return
+        setShippingError(error instanceof Error ? error.message : "Não foi possível carregar o frete.")
+        console.error("Shipping options request failed.", error)
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingShipping(false)
       })
 
+    return () => controller.abort()
+  }, [isOpen])
+
+  const fetchAddressByCep = async () => {
+    setLoadingAddress(true)
+    setShippingError("")
+
+    try {
+      const cleanCep = cep.replace(/\D/g, "")
+      if (cleanCep.length !== 8) throw new Error("CEP deve ter 8 dígitos.")
+
+      const response = await fetch(`https://viacep.com.br/ws/${cleanCep}/json/`, { cache: "no-store" })
+      if (!response.ok) throw new Error("Serviço de CEP indisponível. Tente novamente.")
+      const parsed = addressResponseSchema.safeParse(await response.json())
+      if (!parsed.success || parsed.data.erro) throw new Error("CEP não encontrado.")
+
+      setAddress({
+        cep: cleanCep,
+        street: parsed.data.logradouro,
+        complement: parsed.data.complemento,
+        district: parsed.data.bairro,
+        city: parsed.data.localidade,
+        state: parsed.data.uf,
+      })
       setStep(2)
     } catch (error) {
       toast({
         title: "Erro ao buscar CEP",
-        description: error instanceof Error ? error.message : "Erro desconhecido",
+        description: error instanceof Error ? error.message : "Não foi possível consultar o CEP.",
         variant: "destructive",
       })
     } finally {
-      setLoading(false)
+      setLoadingAddress(false)
     }
   }
 
   const formatCep = (value: string) => {
-    const cleanValue = value.replace(/\D/g, "")
-    if (cleanValue.length <= 5) {
-      return cleanValue
+    const cleanValue = value.replace(/\D/g, "").slice(0, 8)
+    return cleanValue.length <= 5 ? cleanValue : `${cleanValue.slice(0, 5)}-${cleanValue.slice(5)}`
+  }
+
+  const handleCepChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    setCep(formatCep(event.target.value))
+  }
+
+  const handleFinishOrder = async () => {
+    const customer = customerSchema.safeParse(customerData)
+    if (!customer.success || !address || cart.length === 0) {
+      toast({
+        title: "Confira seus dados",
+        description: "Preencha os dados de entrega e contato antes de continuar.",
+        variant: "destructive",
+      })
+      return
     }
-    return `${cleanValue.slice(0, 5)}-${cleanValue.slice(5, 8)}`
-  }
 
-  const handleCepChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const formatted = formatCep(e.target.value)
-    setCep(formatted)
-  }
+    const payload = {
+      items: cart.map((item) => ({
+        productId: item.id,
+        size: item.selectedSize,
+        quantity: item.quantity,
+      })),
+      customer: {
+        name: customer.data.name,
+        email: customer.data.email,
+        phone: customer.data.phone,
+      },
+      address: {
+        ...address,
+        number: customer.data.number,
+        complement: customer.data.complement || address.complement,
+      },
+      shippingMethod: deliveryOption,
+      paymentMethod,
+    }
+    const serializedPayload = JSON.stringify(payload)
+    if (!attempt.current || attempt.current.payload !== serializedPayload) {
+      attempt.current = { payload: serializedPayload, key: crypto.randomUUID() }
+    }
 
-  const getDeliveryPrice = () => {
-    switch (deliveryOption) {
-      case "express":
-        return 25.0
-      case "standard":
-        return 15.0
-      case "economic":
-        return 8.0
-      default:
-        return 15.0
+    setSavingOrder(true)
+    try {
+      const response = await fetch("/api/orders", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": attempt.current.key,
+        },
+        body: serializedPayload,
+      })
+      const body: unknown = await response.json()
+      if (!response.ok) {
+        const message = typeof body === "object" && body !== null && "error" in body
+          ? String(body.error)
+          : "Não foi possível iniciar o pagamento."
+        throw new Error(message)
+      }
+
+      const checkoutUrl =
+        typeof body === "object" && body !== null && "checkoutUrl" in body
+          ? body.checkoutUrl
+          : undefined
+      if (typeof checkoutUrl !== "string" || !isMercadoPagoUrl(checkoutUrl)) {
+        throw new Error("O serviço de pagamento retornou um endereço inválido.")
+      }
+
+      window.location.assign(checkoutUrl)
+    } catch (error) {
+      toast({
+        title: "Não foi possível finalizar a compra",
+        description: error instanceof Error ? error.message : "Tente novamente.",
+        variant: "destructive",
+      })
+    } finally {
+      setSavingOrder(false)
     }
   }
 
-  const getDeliveryTime = () => {
-    switch (deliveryOption) {
-      case "express":
-        return "1-2 dias úteis"
-      case "standard":
-        return "3-5 dias úteis"
-      case "economic":
-        return "7-10 dias úteis"
-      default:
-        return "3-5 dias úteis"
-    }
-  }
-
-  const finalTotal = totalPrice + getDeliveryPrice()
-
-  const handleFinishOrder = () => {
-    toast({
-      title: "Pedido realizado com sucesso!",
-      description: `Seu pedido será entregue em ${getDeliveryTime()}`,
-    })
-    onClose()
-    setStep(1)
-    setCep("")
-    setAddress(null)
-    setCustomerData({
-      name: "",
-      email: "",
-      phone: "",
-      number: "",
-      complement: "",
-    })
-  }
+  const selectedShipping = shippingOptions.find((option) => option.id === deliveryOption)
+  const subtotalCents = cart.reduce((total, item) => total + item.priceCents * item.quantity, 0)
 
   return (
-    <Dialog open={isOpen} onOpenChange={onClose}>
+    <Dialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open && !savingOrder) onClose()
+      }}
+    >
       <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Finalizar Compra</DialogTitle>
@@ -198,27 +284,21 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
                 <div>
                   <Label htmlFor="cep">CEP</Label>
                   <div className="flex gap-2">
-                    <Input id="cep" placeholder="00000-000" value={cep} onChange={handleCepChange} maxLength={9} />
-                    <Button onClick={() => fetchAddressByCep(cep)} disabled={loading || cep.length < 9}>
-                      {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : "Buscar"}
+                    <Input
+                      id="cep"
+                      inputMode="numeric"
+                      autoComplete="postal-code"
+                      placeholder="00000-000"
+                      value={cep}
+                      onChange={handleCepChange}
+                      maxLength={9}
+                    />
+                    <Button onClick={fetchAddressByCep} disabled={loadingAddress || cep.replace(/\D/g, "").length !== 8}>
+                      {loadingAddress ? <Loader2 className="h-4 w-4 animate-spin" /> : "Buscar"}
                     </Button>
                   </div>
                 </div>
-
-                {fakeStoreData && (
-                  <div className="p-4 bg-blue-50 rounded-lg">
-                    <h4 className="font-medium text-blue-900 mb-2">Dados do Cliente (Fake Store API)</h4>
-                    <p className="text-sm text-blue-700">
-                      <strong>Nome:</strong> {fakeStoreData.name.firstname} {fakeStoreData.name.lastname}
-                    </p>
-                    <p className="text-sm text-blue-700">
-                      <strong>Email:</strong> {fakeStoreData.email}
-                    </p>
-                    <p className="text-sm text-blue-700">
-                      <strong>Telefone:</strong> {fakeStoreData.phone}
-                    </p>
-                  </div>
-                )}
+                {shippingError && <p role="alert" className="text-sm text-red-600">{shippingError}</p>}
               </CardContent>
             </Card>
 
@@ -226,22 +306,21 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
               <CardHeader>
                 <CardTitle>Resumo do Pedido</CardTitle>
               </CardHeader>
-              <CardContent>
-                <div className="space-y-2">
-                  {cart.map((item) => (
-                    <div key={`${item.id}-${item.selectedSize}`} className="flex justify-between text-sm">
-                      <span>
-                        {item.name} (Tam. {item.selectedSize}) x{item.quantity}
-                      </span>
-                      <span>R$ {(item.price * item.quantity).toFixed(2)}</span>
-                    </div>
-                  ))}
-                  <Separator />
-                  <div className="flex justify-between font-medium">
-                    <span>Subtotal</span>
-                    <span>R$ {totalPrice.toFixed(2)}</span>
+              <CardContent className="space-y-2">
+                {cart.map((item) => (
+                  <div key={`${item.id}-${item.selectedSize}`} className="flex justify-between text-sm">
+                    <span>{item.name} (Tam. {item.selectedSize}) x{item.quantity}</span>
+                    <span>{formatPrice(item.priceCents * item.quantity)}</span>
                   </div>
+                ))}
+                <Separator />
+                <div className="flex justify-between font-medium">
+                  <span>Subtotal estimado</span>
+                  <span>{formatPrice(subtotalCents)}</span>
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  O valor final será confirmado pelo servidor com os preços atuais do catálogo.
+                </p>
               </CardContent>
             </Card>
           </div>
@@ -254,31 +333,71 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
                 <CardTitle>Confirmar Endereço</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="p-4 bg-green-50 rounded-lg">
-                  <p className="font-medium">{address.logradouro}</p>
-                  <p>
-                    {address.bairro} - {address.localidade}/{address.uf}
-                  </p>
-                  <p>CEP: {address.cep}</p>
+                <div className="rounded-lg bg-green-50 p-4 text-sm">
+                  <p>{address.city}/{address.state} - CEP {formatCep(address.cep)}</p>
                 </div>
 
+                <div>
+                  <Label htmlFor="street">Logradouro</Label>
+                  <Input
+                    id="street"
+                    autoComplete="address-line1"
+                    value={address.street}
+                    onChange={(event) => setAddress({ ...address, street: event.target.value })}
+                    required
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <Label htmlFor="district">Bairro</Label>
+                    <Input
+                      id="district"
+                      autoComplete="address-level3"
+                      value={address.district}
+                      onChange={(event) => setAddress({ ...address, district: event.target.value })}
+                      required
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="city">Cidade</Label>
+                    <Input
+                      id="city"
+                      autoComplete="address-level2"
+                      value={address.city}
+                      onChange={(event) => setAddress({ ...address, city: event.target.value })}
+                      required
+                    />
+                  </div>
+                </div>
+                <div>
+                  <Label htmlFor="state">Estado (UF)</Label>
+                  <Input
+                    id="state"
+                    autoComplete="address-level1"
+                    value={address.state}
+                    maxLength={2}
+                    onChange={(event) => setAddress({ ...address, state: event.target.value.toUpperCase() })}
+                    required
+                  />
+                </div>
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <Label htmlFor="number">Número</Label>
                     <Input
                       id="number"
+                      autoComplete="address-line2"
                       value={customerData.number}
-                      onChange={(e) => setCustomerData({ ...customerData, number: e.target.value })}
-                      placeholder="123"
+                      onChange={(event) => setCustomerData({ ...customerData, number: event.target.value })}
+                      required
                     />
                   </div>
                   <div>
                     <Label htmlFor="complement">Complemento</Label>
                     <Input
                       id="complement"
+                      autoComplete="address-line3"
                       value={customerData.complement}
-                      onChange={(e) => setCustomerData({ ...customerData, complement: e.target.value })}
-                      placeholder="Apto 45"
+                      onChange={(event) => setCustomerData({ ...customerData, complement: event.target.value })}
                     />
                   </div>
                 </div>
@@ -287,9 +406,10 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
                   <Label htmlFor="name">Nome Completo</Label>
                   <Input
                     id="name"
+                    autoComplete="name"
                     value={customerData.name}
-                    onChange={(e) => setCustomerData({ ...customerData, name: e.target.value })}
-                    placeholder="Seu nome completo"
+                    onChange={(event) => setCustomerData({ ...customerData, name: event.target.value })}
+                    required
                   />
                 </div>
 
@@ -299,18 +419,21 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
                     <Input
                       id="email"
                       type="email"
+                      autoComplete="email"
                       value={customerData.email}
-                      onChange={(e) => setCustomerData({ ...customerData, email: e.target.value })}
-                      placeholder="seu@email.com"
+                      onChange={(event) => setCustomerData({ ...customerData, email: event.target.value })}
+                      required
                     />
                   </div>
                   <div>
                     <Label htmlFor="phone">Telefone</Label>
                     <Input
                       id="phone"
+                      type="tel"
+                      autoComplete="tel"
                       value={customerData.phone}
-                      onChange={(e) => setCustomerData({ ...customerData, phone: e.target.value })}
-                      placeholder="(11) 99999-9999"
+                      onChange={(event) => setCustomerData({ ...customerData, phone: event.target.value })}
+                      required
                     />
                   </div>
                 </div>
@@ -325,27 +448,31 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
-                {[
-                  { id: "economic", name: "Econômica", price: 8.0, time: "7-10 dias úteis" },
-                  { id: "standard", name: "Padrão", price: 15.0, time: "3-5 dias úteis" },
-                  { id: "express", name: "Expressa", price: 25.0, time: "1-2 dias úteis" },
-                ].map((option) => (
-                  <div
+                {shippingOptions.map((option) => (
+                  <label
                     key={option.id}
-                    className={`p-3 border rounded-lg cursor-pointer transition-colors ${
+                    className={`flex cursor-pointer items-center justify-between rounded-lg border p-3 ${
                       deliveryOption === option.id ? "border-blue-500 bg-blue-50" : "border-gray-200"
                     }`}
-                    onClick={() => setDeliveryOption(option.id)}
                   >
-                    <div className="flex justify-between items-center">
-                      <div>
-                        <p className="font-medium">{option.name}</p>
-                        <p className="text-sm text-gray-600">{option.time}</p>
-                      </div>
-                      <p className="font-medium">R$ {option.price.toFixed(2)}</p>
-                    </div>
-                  </div>
+                    <span className="flex items-center gap-3">
+                      <input
+                        type="radio"
+                        name="shipping-method"
+                        value={option.id}
+                        checked={deliveryOption === option.id}
+                        onChange={() => setDeliveryOption(option.id)}
+                      />
+                      <span>
+                        <span className="block font-medium">{option.name}</span>
+                        <span className="text-sm text-gray-600">{option.days}</span>
+                      </span>
+                    </span>
+                    <span className="font-medium">{formatPrice(option.priceCents)}</span>
+                  </label>
                 ))}
+                {loadingShipping && <p className="text-sm text-muted-foreground">Carregando fretes...</p>}
+                {shippingError && <p role="alert" className="text-sm text-red-600">{shippingError}</p>}
               </CardContent>
             </Card>
 
@@ -357,21 +484,25 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
                 </CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
-                {[
-                  { id: "credit", name: "Cartão de Crédito", desc: "Visa, Mastercard, Elo" },
-                  { id: "debit", name: "Cartão de Débito", desc: "Débito à vista" },
-                  { id: "pix", name: "PIX", desc: "Pagamento instantâneo" },
-                ].map((option) => (
-                  <div
+                {([
+                  { id: "pix", name: "Pix" },
+                  { id: "card", name: "Cartão de crédito" },
+                ] as const).map((option) => (
+                  <label
                     key={option.id}
-                    className={`p-3 border rounded-lg cursor-pointer transition-colors ${
+                    className={`flex cursor-pointer items-center gap-3 rounded-lg border p-3 ${
                       paymentMethod === option.id ? "border-blue-500 bg-blue-50" : "border-gray-200"
                     }`}
-                    onClick={() => setPaymentMethod(option.id)}
                   >
-                    <p className="font-medium">{option.name}</p>
-                    <p className="text-sm text-gray-600">{option.desc}</p>
-                  </div>
+                    <input
+                      type="radio"
+                      name="payment-method"
+                      value={option.id}
+                      checked={paymentMethod === option.id}
+                      onChange={() => setPaymentMethod(option.id)}
+                    />
+                    <span>{option.name} pelo checkout seguro do Mercado Pago</span>
+                  </label>
                 ))}
               </CardContent>
             </Card>
@@ -380,31 +511,44 @@ export default function CheckoutDialog({ isOpen, onClose, cart, totalPrice }: Ch
               <CardHeader>
                 <CardTitle>Resumo Final</CardTitle>
               </CardHeader>
-              <CardContent>
-                <div className="space-y-2">
-                  <div className="flex justify-between text-sm">
-                    <span>Subtotal dos produtos</span>
-                    <span>R$ {totalPrice.toFixed(2)}</span>
-                  </div>
-                  <div className="flex justify-between text-sm">
-                    <span>Frete ({getDeliveryTime()})</span>
-                    <span>R$ {getDeliveryPrice().toFixed(2)}</span>
-                  </div>
-                  <Separator />
-                  <div className="flex justify-between font-bold text-lg">
-                    <span>Total</span>
-                    <span>R$ {finalTotal.toFixed(2)}</span>
-                  </div>
+              <CardContent className="space-y-2">
+                <div className="flex justify-between text-sm">
+                  <span>Subtotal estimado</span>
+                  <span>{formatPrice(subtotalCents)}</span>
                 </div>
+                {selectedShipping && (
+                  <div className="flex justify-between text-sm">
+                    <span>Frete ({selectedShipping.days})</span>
+                    <span>{formatPrice(selectedShipping.priceCents)}</span>
+                  </div>
+                )}
+                <Separator />
+                <div className="flex justify-between font-semibold">
+                  <span>Total estimado</span>
+                  <span>
+                    {selectedShipping
+                      ? formatPrice(subtotalCents + selectedShipping.priceCents)
+                      : "—"}
+                  </span>
+                </div>
+                <Separator />
+                <p className="text-xs text-muted-foreground">
+                  O total definitivo será recalculado no servidor antes de gerar o pagamento.
+                </p>
               </CardContent>
             </Card>
 
             <div className="flex gap-3">
-              <Button variant="outline" onClick={() => setStep(1)} className="flex-1">
+              <Button variant="outline" onClick={() => setStep(1)} className="flex-1" disabled={savingOrder}>
                 Voltar
               </Button>
-              <Button onClick={handleFinishOrder} className="flex-1">
-                Finalizar Pedido
+              <Button
+                onClick={handleFinishOrder}
+                className="flex-1"
+                disabled={savingOrder || loadingShipping || !selectedShipping || !!shippingError}
+              >
+                {savingOrder ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                Ir para pagamento
               </Button>
             </div>
           </div>

@@ -1,10 +1,13 @@
 import type { Metadata } from 'next'
+import { Providers } from './providers'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'v0 App',
-  description: 'Created with v0',
-  generator: 'v0.dev',
+  title: {
+    default: "JeansStore",
+    template: "%s | JeansStore",
+  },
+  description: "Encontre seu próximo jeans favorito na JeansStore.",
 }
 
 export default function RootLayout({
@@ -13,8 +16,10 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en">
-      <body>{children}</body>
+    <html lang="pt-BR">
+      <body>
+        <Providers>{children}</Providers>
+      </body>
     </html>
   )
 }
