@@ -30,7 +30,7 @@ Saia e entre novamente para renovar a sessão. O painel permite cadastrar/editar
 - **Mercado Pago:** use credenciais de teste localmente e configure a URL pública `https://SEU_DOMINIO/api/webhooks/mercadopago` como webhook de pagamentos. Configure `MP_WEBHOOK_SECRET` com a assinatura secreta da integração. O pedido só é marcado como pago após a assinatura ser validada e o pagamento ser consultado diretamente na API do Mercado Pago.
 - **Resend:** configure `RESEND_API_KEY` e `EMAIL_FROM` com um remetente verificado. O email de confirmação é enviado após o pagamento aprovado.
 - **CEP:** o checkout consulta ViaCEP. A cotação de frete atual é uma tabela fixa configurável por variáveis em centavos; ela ainda não consulta transportadora. Os valores do `.env.example` são apenas exemplos e devem ser substituídos antes de qualquer venda.
-- **Pedidos pendentes:** a configuração Vercel agenda a expiração a cada 15 minutos. Configure `CRON_SECRET` no ambiente de produção; em outro host, agende `GET /api/cron/expire-orders` com `Authorization: Bearer <CRON_SECRET>`.
+- **Pedidos pendentes:** no plano Hobby, a Vercel agenda a expiração uma vez por dia, às 03:00 UTC. Configure `CRON_SECRET` no ambiente de produção. Como a limpeza é diária, a devolução de estoque pode ocorrer até aproximadamente 24 horas depois do prazo do pedido; para expiração mais rápida, use um plano Vercel que permita crons mais frequentes ou um agendador externo para chamar `GET /api/cron/expire-orders` com o cabeçalho `Authorization` configurado com `CRON_SECRET`.
 
 ## Verificações
 
